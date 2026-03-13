@@ -3,3 +3,4 @@ result/
 *.pth
 *.pkl
 *.csv
+__pycache__/
