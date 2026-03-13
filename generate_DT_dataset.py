@@ -161,4 +161,4 @@ def generate_offline_dataset(episodes=1000, save_path="expert_dataset.pkl", base
 
 
 if __name__ == "__main__":
-    generate_offline_dataset(episodes=1000)
+    generate_offline_dataset(episodes=2000)

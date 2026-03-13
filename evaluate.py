@@ -9,7 +9,6 @@ from generate_DT_dataset import get_state_vector, expert_get_action_with_commitm
 
 CONTEXT_LEN = 50
 TARGET_RETURN = 150000.0
-WAIT_TARGET_STEPS = int(CONFIG.get("wait_target_steps", 2))
 
 
 def evaluate_and_benchmark():
@@ -33,7 +32,6 @@ def evaluate_and_benchmark():
 
     metrics = {
         "dead_evs": set(),
-        "wait_steps_dict": {},
         "wait_start_step": {},
         "served_wait_durations": [],
         "mcs_moving_steps": 0,
@@ -99,7 +97,6 @@ def evaluate_and_benchmark():
             if curr_state == "WAITING":
                 if prev_state != "WAITING":
                     metrics["wait_start_step"][ev.id] = t
-                metrics["wait_steps_dict"][ev.id] = metrics["wait_steps_dict"].get(ev.id, 0) + 1
             else:
                 immediate_wait_then_service = (
                     prev_state == "MOVING" and
@@ -141,20 +138,9 @@ def evaluate_and_benchmark():
     service_rate = (served_total / total_requests * 100.0) if total_requests > 0 else 100.0
     dead_rate = (dead_count / total_requests * 100.0) if total_requests > 0 else 0.0
     step_minutes = CONFIG.get("minutes_per_step", 24.0 * 60.0 / max(1, CONFIG["max_steps"]))
-    avg_wait_all_steps = float(np.mean(list(metrics["wait_steps_dict"].values()))) if metrics["wait_steps_dict"] else 0.0
     avg_wait_served_steps = (
         float(np.mean(metrics["served_wait_durations"])) if metrics["served_wait_durations"] else 0.0
     )
-    served_within_target_count = sum(1 for d in metrics["served_wait_durations"] if d <= WAIT_TARGET_STEPS)
-    wait_within_target_rate = (
-        100.0 * served_within_target_count / total_requests if total_requests > 0 else 100.0
-    )
-    wait_within_target_rate_served = (
-        100.0 * served_within_target_count / len(metrics["served_wait_durations"])
-        if metrics["served_wait_durations"] else 100.0
-    )
-    unresolved_waiting = len(metrics["wait_start_step"])
-    served_wait_count = len(metrics["served_wait_durations"])
 
     print("\n" + "=" * 40)
     print("Decision Transformer Evaluation")
@@ -170,14 +156,7 @@ def evaluate_and_benchmark():
     print(f"Dead Rate: {dead_rate:.2f}%")
     print(f"MCS Served: {env.stats.get('served_mcs', 0)}")
     print(f"FCS Served: {env.stats.get('served_fcs', 0)}")
-    print(f"W<={WAIT_TARGET_STEPS} Steps Rate (all requests): {wait_within_target_rate:.2f}%")
-    print(f"W<={WAIT_TARGET_STEPS} Steps Rate (served only): {wait_within_target_rate_served:.2f}%")
-    print(f"Average Wait (served requests): {avg_wait_served_steps:.1f} steps ({avg_wait_served_steps * step_minutes:.1f} min)")
-    print(f"Average Wait (all waited EVs): {avg_wait_all_steps:.1f} steps ({avg_wait_all_steps * step_minutes:.1f} min)")
-    print(f"Served Wait Samples: {served_wait_count}")
-    print(f"Unresolved Waiting EVs: {unresolved_waiting}")
-    print(f"Overdue Wait Steps (> {WAIT_TARGET_STEPS}): {env.stats.get('overdue_wait_steps', 0)}")
-    print(f"FCS Reassignments: {env.stats.get('fcs_reassignments', 0)}")
+    print(f"Average Wait: {avg_wait_served_steps:.1f} steps ({avg_wait_served_steps * step_minutes:.1f} min)")
     print(f"MCS Moving Steps: {metrics['mcs_moving_steps']}")
     print("=" * 40)
 

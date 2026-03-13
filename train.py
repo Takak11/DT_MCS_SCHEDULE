@@ -14,7 +14,7 @@ from config import *
 # --- 进阶训练超参数 ---
 CONTEXT_LEN = 50
 BATCH_SIZE = 64
-EPOCHS = 200
+EPOCHS = 100
 MAX_LR = 3e-4  # 峰值学习率
 WARMUP_STEPS = 150  # 预热步数 (根据您的数据集大小调整)
 WEIGHT_DECAY = 1e-4
@@ -24,11 +24,8 @@ AUX_REWARD_LOSS_WEIGHT = 0.2
 EVAL_TARGET_RETURN = 150000.0
 EVAL_SEEDS = [42, 43, 44, 45, 46]
 EVAL_EVERY_EPOCHS = 1
-EARLY_STOP_PATIENCE = 40
 BUSINESS_SUCCESS_TOL = 1e-6
 BUSINESS_WAIT_TOL = 1e-6
-BUSINESS_WAIT_TARGET_TOL = 1e-6
-WAIT_TARGET_STEPS = int(CONFIG.get("wait_target_steps", 2))
 BUSINESS_MIN_SUCCESS_RATE = float(CONFIG.get("business_min_success_rate", 93.0))
 
 
@@ -233,7 +230,6 @@ def evaluate_rollout_metrics(model, env, s_mean, s_std, a_mean, a_std, rtg_scale
     current_rtg = target_return
     final_info = {}
 
-    wait_steps_dict = {}
     wait_start_step = {}
     served_wait_durations = []
 
@@ -288,7 +284,6 @@ def evaluate_rollout_metrics(model, env, s_mean, s_std, a_mean, a_std, rtg_scale
                 if curr_state == "WAITING":
                     if prev_state != "WAITING":
                         wait_start_step[ev.id] = t
-                    wait_steps_dict[ev.id] = wait_steps_dict.get(ev.id, 0) + 1
                     continue
 
                 # MOVING -> WAITING -> CHARGING can occur within one env step.
@@ -317,31 +312,11 @@ def evaluate_rollout_metrics(model, env, s_mean, s_std, a_mean, a_std, rtg_scale
             if done:
                 break
 
-    avg_wait_steps_all = float(np.mean(list(wait_steps_dict.values()))) if wait_steps_dict else 0.0
     avg_wait_steps_served = float(np.mean(served_wait_durations)) if served_wait_durations else 0.0
-    wait_target_steps = int(env.cfg.get("wait_target_steps", WAIT_TARGET_STEPS))
-    served_within_target_count = sum(1 for d in served_wait_durations if d <= wait_target_steps)
-    served_wait_count = len(served_wait_durations)
-    total_requests = int(env.stats.get("total_requests", 0))
-
-    wait_within_target_rate_served = (
-        100.0 * served_within_target_count / served_wait_count if served_wait_count > 0 else 100.0
-    )
-    wait_within_target_rate = (
-        100.0 * served_within_target_count / total_requests if total_requests > 0 else 100.0
-    )
-
-    step_minutes = env.cfg.get("minutes_per_step", 24.0 * 60.0 / max(1, env.cfg.get("max_steps", 200)))
     return {
         "success_rate": float(final_info.get("success_rate", env._calculate_success_rate())),
-        # keep this key as "served-request wait" for business optimization backward compatibility
-        "avg_wait_steps": avg_wait_steps_served,
-        "avg_wait_minutes": avg_wait_steps_served * step_minutes,
-        "avg_wait_steps_all": avg_wait_steps_all,
-        "served_wait_count": int(served_wait_count),
-        "unresolved_waiting_count": int(len(wait_start_step)),
-        "wait_within_target_rate": float(wait_within_target_rate),
-        "wait_within_target_rate_served": float(wait_within_target_rate_served)
+        # Canonical wait metric: WAITING start -> first service handling step.
+        "avg_wait_steps": avg_wait_steps_served
     }
 
 
@@ -352,10 +327,6 @@ def evaluate_multi_seed_metrics(model, cfg, seed_list, s_mean, s_std, a_mean, a_
     """
     success_list = []
     wait_steps_list = []
-    wait_minutes_list = []
-    wait_steps_all_list = []
-    wait_within_target_rate_list = []
-    wait_within_target_rate_served_list = []
     eval_cfg = dict(cfg)
     eval_cfg["verbose_dataset_load"] = False
     for seed in seed_list:
@@ -375,24 +346,12 @@ def evaluate_multi_seed_metrics(model, cfg, seed_list, s_mean, s_std, a_mean, a_
         )
         success_list.append(m["success_rate"])
         wait_steps_list.append(m["avg_wait_steps"])
-        wait_minutes_list.append(m["avg_wait_minutes"])
-        wait_steps_all_list.append(m["avg_wait_steps_all"])
-        wait_within_target_rate_list.append(m["wait_within_target_rate"])
-        wait_within_target_rate_served_list.append(m["wait_within_target_rate_served"])
 
     return {
         "success_rate": float(np.mean(success_list)),
         "success_rate_std": float(np.std(success_list)),
         "avg_wait_steps": float(np.mean(wait_steps_list)),
         "avg_wait_steps_std": float(np.std(wait_steps_list)),
-        "avg_wait_minutes": float(np.mean(wait_minutes_list)),
-        "avg_wait_minutes_std": float(np.std(wait_minutes_list)),
-        "avg_wait_steps_all": float(np.mean(wait_steps_all_list)),
-        "avg_wait_steps_all_std": float(np.std(wait_steps_all_list)),
-        "wait_within_target_rate": float(np.mean(wait_within_target_rate_list)),
-        "wait_within_target_rate_std": float(np.std(wait_within_target_rate_list)),
-        "wait_within_target_rate_served": float(np.mean(wait_within_target_rate_served_list)),
-        "wait_within_target_rate_served_std": float(np.std(wait_within_target_rate_served_list)),
         "num_seeds": int(len(seed_list))
     }
 
@@ -416,14 +375,6 @@ def train(dataset_path="expert_dataset.pkl", init_ckpt=None):
         'success_rate_std': [],
         'avg_wait_steps': [],
         'avg_wait_steps_std': [],
-        'avg_wait_minutes': [],
-        'avg_wait_minutes_std': [],
-        'avg_wait_steps_all': [],
-        'avg_wait_steps_all_std': [],
-        'wait_within_target_rate': [],
-        'wait_within_target_rate_std': [],
-        'wait_within_target_rate_served': [],
-        'wait_within_target_rate_served_std': [],
         'eval_num_seeds': []
     }
     # 1. 数据集划分 (90% 训练, 10% 验证)
@@ -461,23 +412,13 @@ def train(dataset_path="expert_dataset.pkl", init_ckpt=None):
     loss_fn = nn.L1Loss(reduction='none')
     best_val_loss = float('inf')
     best_success_rate = -float('inf')
-    best_wait_within_target_rate = -float('inf')
     best_avg_wait_steps = float('inf')
     best_business_epoch = -1
-    early_stop_counter = 0
     last_eval_metrics = {
         "success_rate": np.nan,
         "success_rate_std": np.nan,
         "avg_wait_steps": np.nan,
         "avg_wait_steps_std": np.nan,
-        "avg_wait_minutes": np.nan,
-        "avg_wait_minutes_std": np.nan,
-        "avg_wait_steps_all": np.nan,
-        "avg_wait_steps_all_std": np.nan,
-        "wait_within_target_rate": np.nan,
-        "wait_within_target_rate_std": np.nan,
-        "wait_within_target_rate_served": np.nan,
-        "wait_within_target_rate_served_std": np.nan,
         "num_seeds": 0
     }
     # 3. 开始 Epoch 循环
@@ -581,14 +522,6 @@ def train(dataset_path="expert_dataset.pkl", init_ckpt=None):
         history['success_rate_std'].append(last_eval_metrics['success_rate_std'])
         history['avg_wait_steps'].append(last_eval_metrics['avg_wait_steps'])
         history['avg_wait_steps_std'].append(last_eval_metrics['avg_wait_steps_std'])
-        history['avg_wait_minutes'].append(last_eval_metrics['avg_wait_minutes'])
-        history['avg_wait_minutes_std'].append(last_eval_metrics['avg_wait_minutes_std'])
-        history['avg_wait_steps_all'].append(last_eval_metrics['avg_wait_steps_all'])
-        history['avg_wait_steps_all_std'].append(last_eval_metrics['avg_wait_steps_all_std'])
-        history['wait_within_target_rate'].append(last_eval_metrics['wait_within_target_rate'])
-        history['wait_within_target_rate_std'].append(last_eval_metrics['wait_within_target_rate_std'])
-        history['wait_within_target_rate_served'].append(last_eval_metrics['wait_within_target_rate_served'])
-        history['wait_within_target_rate_served_std'].append(last_eval_metrics['wait_within_target_rate_served_std'])
         history['eval_num_seeds'].append(last_eval_metrics['num_seeds'])
 
         # Refresh CSV each epoch
@@ -600,10 +533,7 @@ def train(dataset_path="expert_dataset.pkl", init_ckpt=None):
             f"Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | "
             f"AuxR: {avg_train_aux_reward_loss:.4f}/{avg_val_aux_reward_loss:.4f} | "
             f"Success: {last_eval_metrics['success_rate']:.2f}\u00b1{last_eval_metrics['success_rate_std']:.2f}% | "
-            f"W<={WAIT_TARGET_STEPS}: {last_eval_metrics['wait_within_target_rate']:.2f}\u00b1{last_eval_metrics['wait_within_target_rate_std']:.2f}% | "
-            f"AvgWait(served): {last_eval_metrics['avg_wait_steps']:.1f}\u00b1{last_eval_metrics['avg_wait_steps_std']:.1f} steps "
-            f"({last_eval_metrics['avg_wait_minutes']:.1f}\u00b1{last_eval_metrics['avg_wait_minutes_std']:.1f} min) | "
-            f"AvgWait(all): {last_eval_metrics['avg_wait_steps_all']:.1f}\u00b1{last_eval_metrics['avg_wait_steps_all_std']:.1f} steps "
+            f"AvgWait: {last_eval_metrics['avg_wait_steps']:.1f}\u00b1{last_eval_metrics['avg_wait_steps_std']:.1f} steps "
             f"(seeds={last_eval_metrics['num_seeds']})"
         )
 
@@ -614,9 +544,8 @@ def train(dataset_path="expert_dataset.pkl", init_ckpt=None):
 
         # Business checkpoint:
         # 1) before reaching min success floor, optimize success first;
-        # 2) once success floor reached, prioritize W<=target rate, then success, then wait steps.
+        # 2) once success floor reached, prioritize lower wait, then success.
         curr_success = last_eval_metrics['success_rate']
-        curr_w2 = last_eval_metrics['wait_within_target_rate']
         curr_wait = last_eval_metrics['avg_wait_steps']
         best_above_floor = (best_success_rate >= BUSINESS_MIN_SUCCESS_RATE)
         curr_above_floor = (curr_success >= BUSINESS_MIN_SUCCESS_RATE)
@@ -626,23 +555,17 @@ def train(dataset_path="expert_dataset.pkl", init_ckpt=None):
                 (curr_success > best_success_rate + BUSINESS_SUCCESS_TOL) or
                 (
                     abs(curr_success - best_success_rate) <= BUSINESS_SUCCESS_TOL and
-                    curr_w2 > best_wait_within_target_rate + BUSINESS_WAIT_TARGET_TOL
+                    curr_wait < best_avg_wait_steps - BUSINESS_WAIT_TOL
                 )
             )
         elif curr_above_floor and not best_above_floor:
             business_improved = True
         elif curr_above_floor and best_above_floor:
             business_improved = (
-                (curr_w2 > best_wait_within_target_rate + BUSINESS_WAIT_TARGET_TOL) or
+                (curr_wait < best_avg_wait_steps - BUSINESS_WAIT_TOL) or
                 (
-                    abs(curr_w2 - best_wait_within_target_rate) <= BUSINESS_WAIT_TARGET_TOL and
-                    (
-                        (curr_success > best_success_rate + BUSINESS_SUCCESS_TOL) or
-                        (
-                            abs(curr_success - best_success_rate) <= BUSINESS_SUCCESS_TOL and
-                            curr_wait < best_avg_wait_steps - BUSINESS_WAIT_TOL
-                        )
-                    )
+                    abs(curr_wait - best_avg_wait_steps) <= BUSINESS_WAIT_TOL and
+                    curr_success > best_success_rate + BUSINESS_SUCCESS_TOL
                 )
             )
         else:
@@ -650,29 +573,17 @@ def train(dataset_path="expert_dataset.pkl", init_ckpt=None):
 
         if business_improved:
             best_success_rate = last_eval_metrics['success_rate']
-            best_wait_within_target_rate = last_eval_metrics['wait_within_target_rate']
             best_avg_wait_steps = last_eval_metrics['avg_wait_steps']
             best_business_epoch = epoch + 1
-            early_stop_counter = 0
             # Main checkpoint used by evaluate.py
             torch.save(model.state_dict(), "dt_mcs_best.pth")
             torch.save(model.state_dict(), "dt_mcs_best_business.pth")
-        elif do_eval:
-            early_stop_counter += 1
-
-        if early_stop_counter >= EARLY_STOP_PATIENCE:
-            print(
-                f"Early stop at epoch {epoch + 1}: no business improvement for "
-                f"{EARLY_STOP_PATIENCE} eval rounds."
-            )
-            break
 
     print(
         f"Training done. Best val loss: {best_val_loss:.4f} | "
         f"Best business epoch: {best_business_epoch} | "
         f"Business success floor: {BUSINESS_MIN_SUCCESS_RATE:.1f}% | "
         f"Best success: {best_success_rate:.2f}% | "
-        f"Best W<={WAIT_TARGET_STEPS}: {best_wait_within_target_rate:.2f}% | "
         f"Best avg wait(served): {best_avg_wait_steps:.2f} steps "
         f"({best_avg_wait_steps * CONFIG.get('minutes_per_step', 24.0 * 60.0 / max(1, CONFIG.get('max_steps', 200))):.2f} min)"
     )
