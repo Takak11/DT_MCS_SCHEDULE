@@ -245,22 +245,43 @@ def _collect_dagger_rollouts(
     return trajectories, summary
 
 
-def _run_finetune(dataset_path, init_ckpt_path, finetune_epochs, eval_seeds):
+def _run_finetune(
+    dataset_path,
+    init_ckpt_path,
+    finetune_epochs,
+    eval_seeds,
+    finetune_aux_reward_weight,
+    phase_name,
+    phase_id,
+    log_path,
+):
     old_epochs = train_module.EPOCHS
     old_eval_seeds = list(train_module.EVAL_SEEDS)
+    old_aux_reward_weight = float(train_module.AUX_REWARD_LOSS_WEIGHT)
     try:
         train_module.EPOCHS = finetune_epochs
         train_module.EVAL_SEEDS = list(eval_seeds)
-        train_module.train(dataset_path=str(dataset_path), init_ckpt=str(init_ckpt_path))
+        train_module.AUX_REWARD_LOSS_WEIGHT = float(finetune_aux_reward_weight)
+        train_module.train(
+            dataset_path=str(dataset_path),
+            init_ckpt=str(init_ckpt_path),
+            log_path=str(log_path),
+            append_log=True,
+            phase=str(phase_name),
+            phase_id=int(phase_id),
+        )
     finally:
         train_module.EPOCHS = old_epochs
         train_module.EVAL_SEEDS = old_eval_seeds
+        train_module.AUX_REWARD_LOSS_WEIGHT = old_aux_reward_weight
 
 
 def _beta_for_iter(iter_idx, num_iters, beta_start, beta_end):
     if num_iters <= 1:
         return beta_end
     alpha = iter_idx / float(num_iters - 1)
+    # Slower-than-linear annealing: keep more expert guidance in early DAgger rounds.
+    alpha = alpha ** 1.5
     return beta_start + alpha * (beta_end - beta_start)
 
 
@@ -268,11 +289,13 @@ def run_dagger(
     base_dataset_path,
     dagger_dataset_path,
     init_ckpt_path,
+    log_path,
     num_iters,
     collect_episodes,
     beta_start,
     beta_end,
     finetune_epochs,
+    finetune_aux_reward_weight,
     eval_seeds,
     start_seed,
     target_return,
@@ -282,6 +305,7 @@ def run_dagger(
     base_dataset_path = Path(base_dataset_path)
     dagger_dataset_path = Path(dagger_dataset_path)
     init_ckpt_path = Path(init_ckpt_path)
+    log_path = Path(log_path)
 
     _bootstrap_dataset(base_dataset_path, dagger_dataset_path, bootstrap_episodes)
 
@@ -321,6 +345,10 @@ def run_dagger(
             init_ckpt_path=init_ckpt_path,
             finetune_epochs=finetune_epochs,
             eval_seeds=eval_seeds,
+            finetune_aux_reward_weight=finetune_aux_reward_weight,
+            phase_name=f"DAgger-{it + 1}",
+            phase_id=it + 1,
+            log_path=log_path,
         )
         # train() writes newest business-best checkpoint here.
         init_ckpt_path = Path("dt_mcs_best.pth")
@@ -333,12 +361,14 @@ def parse_args():
     parser.add_argument("--base-dataset", type=str, default="expert_dataset.pkl")
     parser.add_argument("--dagger-dataset", type=str, default="expert_dataset_dagger.pkl")
     parser.add_argument("--init-ckpt", type=str, default="dt_mcs_best.pth")
+    parser.add_argument("--log-path", type=str, default="train_log_v2.csv")
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--collect-episodes", type=int, default=100)
-    parser.add_argument("--beta-start", type=float, default=0.8)
-    parser.add_argument("--beta-end", type=float, default=0.1)
-    parser.add_argument("--finetune-epochs", type=int, default=80)
-    parser.add_argument("--eval-seeds", type=str, default="42,43,44,45,46")
+    parser.add_argument("--beta-start", type=float, default=0.9)
+    parser.add_argument("--beta-end", type=float, default=0.3)
+    parser.add_argument("--finetune-epochs", type=int, default=30)
+    parser.add_argument("--finetune-aux-reward-weight", type=float, default=0.05)
+    parser.add_argument("--eval-seeds", type=str, default="42,43,44,45,46,47,48,49,50,51")
     parser.add_argument("--start-seed", type=int, default=7000)
     parser.add_argument("--target-return", type=float, default=train_module.EVAL_TARGET_RETURN)
     parser.add_argument("--bootstrap-episodes", type=int, default=1000)
@@ -352,11 +382,13 @@ if __name__ == "__main__":
         base_dataset_path=args.base_dataset,
         dagger_dataset_path=args.dagger_dataset,
         init_ckpt_path=args.init_ckpt,
+        log_path=args.log_path,
         num_iters=args.iters,
         collect_episodes=args.collect_episodes,
         beta_start=args.beta_start,
         beta_end=args.beta_end,
         finetune_epochs=args.finetune_epochs,
+        finetune_aux_reward_weight=args.finetune_aux_reward_weight,
         eval_seeds=eval_seeds,
         start_seed=args.start_seed,
         target_return=args.target_return,

@@ -1,4 +1,4 @@
-import torch
+﻿import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
@@ -11,27 +11,48 @@ from DT import DecisionTransformer
 from env import ChargingEnv
 from generate_DT_dataset import get_state_vector
 from config import *
-# --- 进阶训练超参数 ---
+
 CONTEXT_LEN = 50
 BATCH_SIZE = 64
-EPOCHS = 100
-MAX_LR = 3e-4  # 峰值学习率
-WARMUP_STEPS = 150  # 预热步数 (根据您的数据集大小调整)
+EPOCHS = 50
+MAX_LR = 2e-4  # peak learning rate
+WARMUP_STEPS = 300  # warmup steps
 WEIGHT_DECAY = 1e-4
 ACTIVE_LOSS_WEIGHT = 2.0
 ACTIVE_MOVE_THRESH_DEG = 1e-6
-AUX_REWARD_LOSS_WEIGHT = 0.2
+AUX_REWARD_LOSS_WEIGHT = 0.05
 EVAL_TARGET_RETURN = 150000.0
-EVAL_SEEDS = [42, 43, 44, 45, 46]
+EVAL_SEEDS = [42, 43, 44, 45, 46, 47, 48, 49, 50, 51]
 EVAL_EVERY_EPOCHS = 1
+EARLY_STOP_PATIENCE = 15
+EARLY_STOP_MIN_EPOCHS = 20
+EARLY_STOP_WINDOW = 5
+EARLY_STOP_SUCCESS_DELTA = 1e-4
+EARLY_STOP_VAL_LOSS_DELTA = 1e-4
 BUSINESS_SUCCESS_TOL = 1e-6
 BUSINESS_WAIT_TOL = 1e-6
 BUSINESS_MIN_SUCCESS_RATE = float(CONFIG.get("business_min_success_rate", 93.0))
 
+TRAIN_LOG_COLUMNS = [
+    "epoch",
+    "phase",
+    "phase_id",
+    "phase_epoch",
+    "train_loss",
+    "val_loss",
+    "train_aux_reward_loss",
+    "val_aux_reward_loss",
+    "dist_error_meters",
+    "learning_rate",
+    "active_dist_error_meters",
+    "success_rate",
+    "success_rate_std",
+    "avg_wait_steps",
+    "avg_wait_steps_std",
+    "eval_num_seeds",
+]
 
-# ==========================================
-# 1. 数据集定义 (复用我们上一版加了归一化的代码)
-# ==========================================
+
 class ExpertDataset(Dataset):
     def __init__(self, pkl_path, context_len):
         with open(pkl_path, 'rb') as f:
@@ -53,7 +74,6 @@ class ExpertDataset(Dataset):
         self.rtg_scale = np.max(np.abs(all_rtgs)) + 1e-6
         self.reward_mean, self.reward_std = all_rewards.mean(), all_rewards.std() + 1e-6
 
-        # 只在初始化时保存一次
         with open("scaler_params.pkl", "wb") as f:
             pickle.dump({
                 'state_mean': self.state_mean,
@@ -80,7 +100,6 @@ class ExpertDataset(Dataset):
         r = np.asarray(traj.get('rewards', np.zeros(seq_len, dtype=np.float32)), dtype=np.float32)[start_idx:end_idx].reshape(-1, 1)
         timesteps = np.arange(start_idx, start_idx + len(s))
 
-        # 归一化
         s = (s - self.state_mean) / self.state_std
         a = (a - self.action_mean) / self.action_std
         rtg = rtg / self.rtg_scale
@@ -184,6 +203,7 @@ def compute_masked_regression_loss(loss_elem, seq_mask):
         return torch.tensor(0.0, device=loss_elem.device)
     return valid_loss.mean()
 
+
 def configure_optimizers(model, learning_rate, weight_decay):
     decay, no_decay = set(), set()
     whitelist_weight_modules = (nn.Linear,)
@@ -207,15 +227,12 @@ def configure_optimizers(model, learning_rate, weight_decay):
     return optim.AdamW(optim_groups, lr=learning_rate)
 
 
-# ==========================================
-# 3. 带 Warmup 的余弦退火学习率调度器
-# ==========================================
 def get_lr_scheduler(optimizer, warmup_steps, total_steps):
     def lr_lambda(current_step):
         if current_step < warmup_steps:
             return float(current_step) / float(max(1, warmup_steps))
         progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        return 0.5 * (1.0 + math.cos(math.pi * progress))  # 余弦下降
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -356,28 +373,56 @@ def evaluate_multi_seed_metrics(model, cfg, seed_list, s_mean, s_std, a_mean, a_
     }
 
 
-# ==========================================
-# 4. 主训练循环 (Train + Validation)
-# ==========================================
-def train(dataset_path="expert_dataset.pkl", init_ckpt=None):
+def _init_history(log_path, append_log, default_phase="DT", default_phase_id=0):
+    history = {k: [] for k in TRAIN_LOG_COLUMNS}
+    epoch_offset = 0
+
+    if (not append_log) or (not os.path.exists(log_path)):
+        return history, epoch_offset
+
+    try:
+        old_df = pd.read_csv(log_path)
+    except Exception:
+        return history, epoch_offset
+
+    if old_df.empty:
+        return history, epoch_offset
+
+    if "epoch" in old_df.columns:
+        epoch_num = pd.to_numeric(old_df["epoch"], errors="coerce").dropna()
+        epoch_offset = int(epoch_num.max()) if len(epoch_num) > 0 else len(old_df)
+    else:
+        epoch_offset = len(old_df)
+
+    row_num = len(old_df)
+    for col in TRAIN_LOG_COLUMNS:
+        if col in old_df.columns:
+            history[col] = old_df[col].tolist()
+        elif col == "phase":
+            history[col] = [default_phase] * row_num
+        elif col == "phase_id":
+            history[col] = [default_phase_id] * row_num
+        elif col == "phase_epoch":
+            history[col] = list(range(1, row_num + 1))
+        else:
+            history[col] = [np.nan] * row_num
+
+    return history, epoch_offset
+
+
+def train(
+    dataset_path="expert_dataset.pkl",
+    init_ckpt=None,
+    log_path="train_log_v2.csv",
+    append_log=False,
+    phase="DT",
+    phase_id=0,
+):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"设备: {device}")
-    history = {
-        'epoch': [],
-        'train_loss': [],
-        'val_loss': [],
-        'train_aux_reward_loss': [],
-        'val_aux_reward_loss': [],
-        'dist_error_meters': [],
-        'learning_rate': [],
-        'active_dist_error_meters': [],
-        'success_rate': [],
-        'success_rate_std': [],
-        'avg_wait_steps': [],
-        'avg_wait_steps_std': [],
-        'eval_num_seeds': []
-    }
-    # 1. 数据集划分 (90% 训练, 10% 验证)
+    print(f"Device: {device}")
+    history, epoch_offset = _init_history(log_path, append_log, default_phase="DT", default_phase_id=0)
+
+
     full_dataset = ExpertDataset(dataset_path, CONTEXT_LEN)
 
     a_mean = torch.from_numpy(full_dataset.action_mean).to(device)
@@ -395,7 +440,7 @@ def train(dataset_path="expert_dataset.pkl", init_ckpt=None):
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-    # 2. 初始化模型与优化器
+
     model = DecisionTransformer(
         state_dim=full_dataset.state_dim, action_dim=full_dataset.action_dim, max_length=200
     ).to(device)
@@ -414,6 +459,19 @@ def train(dataset_path="expert_dataset.pkl", init_ckpt=None):
     best_success_rate = -float('inf')
     best_avg_wait_steps = float('inf')
     best_business_epoch = -1
+    best_business_global_epoch = -1
+    best_success_ckpt_rate = -float('inf')
+    best_success_ckpt_wait = float('inf')
+    best_success_ckpt_epoch = -1
+    best_success_ckpt_global_epoch = -1
+    early_stop_counter = 0
+    success_window = []
+    val_loss_window = []
+    best_window_success = -float('inf')
+    best_window_val_loss = float('inf')
+    effective_early_stop_min_epochs = min(
+        EARLY_STOP_MIN_EPOCHS, max(EARLY_STOP_WINDOW, EPOCHS // 3)
+    )
     last_eval_metrics = {
         "success_rate": np.nan,
         "success_rate_std": np.nan,
@@ -421,7 +479,7 @@ def train(dataset_path="expert_dataset.pkl", init_ckpt=None):
         "avg_wait_steps_std": np.nan,
         "num_seeds": 0
     }
-    # 3. 开始 Epoch 循环
+
     for epoch in range(EPOCHS):
 
         model.train()
@@ -436,7 +494,6 @@ def train(dataset_path="expert_dataset.pkl", init_ckpt=None):
                 states, actions, rtgs, timesteps, attention_mask=masks, return_aux=True
             )
 
-            # Mask 掉 Padding 部分的 Loss
             action_loss_elem = loss_fn(action_preds, actions)
             action_loss = compute_weighted_action_loss(action_loss_elem, actions, masks, a_mean, a_std)
             reward_loss_elem = loss_fn(reward_preds, rewards)
@@ -445,9 +502,9 @@ def train(dataset_path="expert_dataset.pkl", init_ckpt=None):
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # 梯度裁剪防止爆炸
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            scheduler.step()  # 更新学习率
+            scheduler.step()
 
             train_loss += loss.item()
             train_aux_reward_loss += reward_loss.item()
@@ -456,7 +513,7 @@ def train(dataset_path="expert_dataset.pkl", init_ckpt=None):
         avg_train_aux_reward_loss = train_aux_reward_loss / len(train_loader)
         current_lr = optimizer.param_groups[0]['lr']
 
-        # 4. 验证循环 (Validation)
+        # 4. Validation
         active_val_errors = []
         model.eval()
         val_dist_errors = []
@@ -482,8 +539,6 @@ def train(dataset_path="expert_dataset.pkl", init_ckpt=None):
                 val_loss += loss.item()
                 val_aux_reward_loss += reward_loss.item()
 
-                # 将归一化的预测值还原回经纬度
-                # 假设 a_std 和 a_mean 是你之前存的动作归一化参数
                 val_dist_errors.append(
                     compute_mean_dist_error(action_preds, actions, a_mean, a_std, masks)
                 )
@@ -492,7 +547,11 @@ def train(dataset_path="expert_dataset.pkl", init_ckpt=None):
         avg_val_aux_reward_loss = val_aux_reward_loss / max(1, len(val_loader))
 
         avg_dist_m = np.mean(val_dist_errors)
-        history['epoch'].append(epoch + 1)
+        global_epoch = epoch_offset + epoch + 1
+        history['epoch'].append(global_epoch)
+        history['phase'].append(str(phase))
+        history['phase_id'].append(int(phase_id))
+        history['phase_epoch'].append(epoch + 1)
         history['train_loss'].append(avg_train_loss)
         history['val_loss'].append(avg_val_loss)
         history['train_aux_reward_loss'].append(avg_train_aux_reward_loss)
@@ -525,11 +584,11 @@ def train(dataset_path="expert_dataset.pkl", init_ckpt=None):
         history['eval_num_seeds'].append(last_eval_metrics['num_seeds'])
 
         # Refresh CSV each epoch
-        pd.DataFrame(history).to_csv("train_log_v2.csv", index=False)
+        pd.DataFrame(history).to_csv(log_path, index=False)
 
         # Logging
         print(
-            f"Epoch {epoch + 1:03d}/{EPOCHS} | LR: {current_lr:.2e} | "
+            f"Epoch {epoch + 1:03d}/{EPOCHS} (global {global_epoch:03d}) | LR: {current_lr:.2e} | "
             f"Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | "
             f"AuxR: {avg_train_aux_reward_loss:.4f}/{avg_val_aux_reward_loss:.4f} | "
             f"Success: {last_eval_metrics['success_rate']:.2f}\u00b1{last_eval_metrics['success_rate_std']:.2f}% | "
@@ -547,6 +606,22 @@ def train(dataset_path="expert_dataset.pkl", init_ckpt=None):
         # 2) once success floor reached, prioritize lower wait, then success.
         curr_success = last_eval_metrics['success_rate']
         curr_wait = last_eval_metrics['avg_wait_steps']
+
+        # Success-first checkpoint: maximize success rate, then break ties with lower wait.
+        success_ckpt_improved = (
+            (curr_success > best_success_ckpt_rate + BUSINESS_SUCCESS_TOL) or
+            (
+                abs(curr_success - best_success_ckpt_rate) <= BUSINESS_SUCCESS_TOL and
+                curr_wait < best_success_ckpt_wait - BUSINESS_WAIT_TOL
+            )
+        )
+        if success_ckpt_improved:
+            best_success_ckpt_rate = curr_success
+            best_success_ckpt_wait = curr_wait
+            best_success_ckpt_epoch = epoch + 1
+            best_success_ckpt_global_epoch = global_epoch
+            torch.save(model.state_dict(), "dt_mcs_best_success.pth")
+
         best_above_floor = (best_success_rate >= BUSINESS_MIN_SUCCESS_RATE)
         curr_above_floor = (curr_success >= BUSINESS_MIN_SUCCESS_RATE)
 
@@ -575,15 +650,61 @@ def train(dataset_path="expert_dataset.pkl", init_ckpt=None):
             best_success_rate = last_eval_metrics['success_rate']
             best_avg_wait_steps = last_eval_metrics['avg_wait_steps']
             best_business_epoch = epoch + 1
+            best_business_global_epoch = global_epoch
             # Main checkpoint used by evaluate.py
             torch.save(model.state_dict(), "dt_mcs_best.pth")
             torch.save(model.state_dict(), "dt_mcs_best_business.pth")
 
+        # Early stop by dual-window trend:
+        # stop only when both success window and val-loss window stop improving.
+        if do_eval:
+            success_window.append(curr_success)
+            val_loss_window.append(avg_val_loss)
+            if len(success_window) > EARLY_STOP_WINDOW:
+                success_window.pop(0)
+            if len(val_loss_window) > EARLY_STOP_WINDOW:
+                val_loss_window.pop(0)
+            if len(success_window) == EARLY_STOP_WINDOW:
+                window_success = float(np.mean(success_window))
+                window_val_loss = float(np.mean(val_loss_window))
+                success_improved = window_success > best_window_success + EARLY_STOP_SUCCESS_DELTA
+                val_loss_improved = window_val_loss < best_window_val_loss - EARLY_STOP_VAL_LOSS_DELTA
+
+                if success_improved:
+                    best_window_success = window_success
+                if val_loss_improved:
+                    best_window_val_loss = window_val_loss
+
+                if success_improved or val_loss_improved:
+                    early_stop_counter = 0
+                else:
+                    early_stop_counter += 1
+
+        if (
+            do_eval and
+            (epoch + 1) >= effective_early_stop_min_epochs and
+            len(success_window) == EARLY_STOP_WINDOW and
+            early_stop_counter >= EARLY_STOP_PATIENCE
+        ):
+            print(
+                f"Early stop at epoch {epoch + 1} (global {global_epoch}): "
+                f"window({EARLY_STOP_WINDOW}) success and val-loss both no improvement for "
+                f"{EARLY_STOP_PATIENCE} eval rounds."
+            )
+            break
+
     print(
         f"Training done. Best val loss: {best_val_loss:.4f} | "
-        f"Best business epoch: {best_business_epoch} | "
+        f"Best business epoch: {best_business_epoch} (global {best_business_global_epoch}) | "
+        f"Best success-only epoch: {best_success_ckpt_epoch} (global {best_success_ckpt_global_epoch}) | "
         f"Business success floor: {BUSINESS_MIN_SUCCESS_RATE:.1f}% | "
         f"Best success: {best_success_rate:.2f}% | "
+        f"Best success-only: {best_success_ckpt_rate:.2f}% | "
+        f"Best window({EARLY_STOP_WINDOW}) success mean: "
+        f"{(best_window_success if best_window_success > -float('inf') else float('nan')):.2f}% | "
+        f"Best window({EARLY_STOP_WINDOW}) val-loss mean: "
+        f"{(best_window_val_loss if best_window_val_loss < float('inf') else float('nan')):.4f} | "
+        f"ES min epochs: {effective_early_stop_min_epochs} | "
         f"Best avg wait(served): {best_avg_wait_steps:.2f} steps "
         f"({best_avg_wait_steps * CONFIG.get('minutes_per_step', 24.0 * 60.0 / max(1, CONFIG.get('max_steps', 200))):.2f} min)"
     )
@@ -591,3 +712,4 @@ def train(dataset_path="expert_dataset.pkl", init_ckpt=None):
 
 if __name__ == "__main__":
     train()
+

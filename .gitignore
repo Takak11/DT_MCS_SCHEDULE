@@ -4,3 +4,4 @@ result/
 *.pkl
 *.csv
 __pycache__/
+.idea

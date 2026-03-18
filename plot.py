@@ -23,6 +23,16 @@ def _load_trajectories(dataset_path):
     return data
 
 
+def _draw_phase_boundaries(ax, df):
+    if "phase" not in df.columns or len(df) <= 1:
+        return
+    phase = df["phase"].astype(str).fillna("DT")
+    change_idx = np.where(phase.values[1:] != phase.values[:-1])[0] + 1
+    for idx in change_idx:
+        x = df["epoch"].iloc[idx]
+        ax.axvline(x=x, color="#7f7f7f", linestyle="--", alpha=0.5, linewidth=1)
+
+
 def plot_training_and_service_metrics(log_path="train_log_v2.csv"):
     try:
         df = pd.read_csv(log_path)
@@ -77,6 +87,7 @@ def plot_training_and_service_metrics(log_path="train_log_v2.csv"):
         axes[3].set_xlabel("Epoch")
         axes[3].set_ylabel("Percent (%)")
         axes[3].set_ylim(60, 100)
+        _draw_phase_boundaries(axes[3], df)
     else:
         axes[3].set_visible(False)
 
@@ -94,6 +105,7 @@ def plot_training_and_service_metrics(log_path="train_log_v2.csv"):
         axes[4].set_xlabel("Epoch")
         axes[4].set_ylabel("Steps")
         axes[4].legend()
+        _draw_phase_boundaries(axes[4], df)
     else:
         axes[4].set_visible(False)
 
@@ -110,6 +122,57 @@ def plot_training_and_service_metrics(log_path="train_log_v2.csv"):
     out_path = prefix + "dt_performance_report.png"
     plt.savefig(out_path, dpi=300, bbox_inches="tight")
     print(f"Saved training report to {out_path}")
+
+
+def plot_dt_dagger_success_trend(log_path="train_log_v2.csv"):
+    try:
+        df = pd.read_csv(log_path)
+    except FileNotFoundError:
+        print(f"Cannot find {log_path}. Please run training first.")
+        return
+
+    if "success_rate" not in df.columns or len(df) == 0:
+        print("No success_rate column found. Skip DT->DAgger trend plot.")
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    sns.lineplot(data=df, x="epoch", y="success_rate", ax=ax, color="#1f77b4", lw=2, label="Success Rate")
+    if "success_rate_std" in df.columns:
+        low = (df["success_rate"] - df["success_rate_std"]).clip(lower=0)
+        high = (df["success_rate"] + df["success_rate_std"]).clip(upper=100)
+        ax.fill_between(df["epoch"], low, high, color="#1f77b4", alpha=0.15, label="+/-1 std")
+
+    if "phase" in df.columns:
+        phase = df["phase"].astype(str).fillna("DT")
+        seg_id = (phase != phase.shift(1)).cumsum()
+        colors = ["#eaf3ff", "#fff5e6", "#eef9ef", "#f7eefc", "#fcefee"]
+        for i, (_, seg) in enumerate(df.groupby(seg_id)):
+            x0 = float(seg["epoch"].iloc[0])
+            x1 = float(seg["epoch"].iloc[-1])
+            p_name = str(seg["phase"].iloc[0])
+            ax.axvspan(x0, x1, color=colors[i % len(colors)], alpha=0.25)
+            ax.text((x0 + x1) * 0.5, 99.3, p_name, ha="center", va="top", fontsize=9)
+        _draw_phase_boundaries(ax, df)
+
+    x0 = float(df["epoch"].iloc[0])
+    y0 = float(df["success_rate"].iloc[0])
+    x1 = float(df["epoch"].iloc[-1])
+    y1 = float(df["success_rate"].iloc[-1])
+    ax.scatter([x0, x1], [y0, y1], color=["#2ca02c", "#d62728"], zorder=5)
+    ax.annotate(f"Start {y0:.1f}%", (x0, y0), textcoords="offset points", xytext=(8, 8))
+    ax.annotate(f"End {y1:.1f}%", (x1, y1), textcoords="offset points", xytext=(8, -16))
+
+    y_min = max(0.0, min(60.0, float(df["success_rate"].min()) - 5.0))
+    ax.set_ylim(y_min, 100.0)
+    ax.set_xlabel("Global Epoch")
+    ax.set_ylabel("Success Rate (%)")
+    ax.set_title("DT -> DAgger Success Trend")
+    ax.legend(loc="lower right")
+    plt.tight_layout()
+
+    out_path = prefix + "dt_dagger_success_trend.png"
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    print(f"Saved DT->DAgger trend to {out_path}")
 
 
 def visualize_trajectory(dataset_path="expert_dataset.pkl", episode_idx=0, mcs_num=20, ev_slots=50):
@@ -248,3 +311,4 @@ def visualize_ev_demand(dataset_path="expert_dataset.pkl", episode_idx=0, mcs_nu
 
 if __name__ == "__main__":
     plot_training_and_service_metrics()
+    plot_dt_dagger_success_trend()
