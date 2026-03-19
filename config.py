@@ -1,12 +1,13 @@
 ﻿CONFIG = {
     "ev_battery_capacity_kwh": 50.0,
-    "ev_consumption_rate": 0.2,
+    "ev_consumption_rate": 0.3,
     "ev_init_soc_mean": 0.80,
     "ev_init_soc_std": 0.28,
     "ev_request_threshold": 0.2,
 
-    "mcs_speed_km_per_step": 4.0,
+    "mcs_speed_km_per_step": 3.0,
     "mcs_num": 20,
+    "mcs_price_per_kwh": 1.6,
 
     "reward_wait_penalty": -1.0,
     "reward_wait_overdue_penalty": -4.0,
@@ -39,13 +40,13 @@ CONFIG.update({
     ],
     "fcs_capacity": 3,
     "ev_fcs_search_radius": 3,
-    "ev_fcs_drive_speed_km_per_step": 4.0,
+    "ev_fcs_drive_speed_km_per_step": 3.0,
     "ev_charge_soc_per_step": 0.216,
     "ev_target_soc": 0.8
 })
 
 CONFIG.update({
-    "mcs_service_radius_km": 2,
+    "mcs_service_radius_km": 1,
 })
 
 CONFIG.update({

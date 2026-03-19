@@ -39,7 +39,12 @@ class ChargingEnv:
         self.evs = {}
         self.mcs = {}
         self.fcs = {}
-        self.stats = {
+        self.stats = self._empty_stats()
+        self.waiting_streak = {}
+        self._load_dataset()
+
+    def _empty_stats(self):
+        return {
             "total_requests": 0,
             "served_mcs": 0,
             "served_fcs": 0,
@@ -47,9 +52,10 @@ class ChargingEnv:
             "current_waiting": 0,
             "overdue_wait_steps": 0,
             "fcs_reassignments": 0,
+            "mcs_total_energy_kwh": 0.0,
+            "mcs_total_revenue": 0.0,
+            "mcs_revenue_by_mcs": {},
         }
-        self.waiting_streak = {}
-        self._load_dataset()
 
     def seed(self, seed=None):
         """Set random seed for environment."""
@@ -85,15 +91,7 @@ class ChargingEnv:
         self.evs.clear()
         self.mcs.clear()
         self.fcs.clear()
-        self.stats = {
-            "total_requests": 0,
-            "served_mcs": 0,
-            "served_fcs": 0,
-            "dead_evs": 0,
-            "current_waiting": 0,
-            "overdue_wait_steps": 0,
-            "fcs_reassignments": 0,
-        }
+        self.stats = self._empty_stats()
         self.waiting_streak = {}
         for ev_id, track in self.trajectories.items():
             self.evs[ev_id] = EV(ev_id, track, self.cfg)
@@ -111,6 +109,7 @@ class ChargingEnv:
             init_lat, init_lon = uniform_positions[i]
             pos = (init_lat, init_lon)
             self.mcs[f"MCS_{i}"] = MCS(f"MCS_{i}", pos, self.cfg)
+        self.stats["mcs_revenue_by_mcs"] = {mcs_id: 0.0 for mcs_id in self.mcs.keys()}
 
         for i, pos in enumerate(self.cfg["fcs_locations"]):
             self.fcs[f"FCS_{i}"] = FCS(f"FCS_{i}", pos, self.cfg["fcs_capacity"])
@@ -274,7 +273,20 @@ class ChargingEnv:
 
             target_soc = self.cfg["ev_target_soc"]
             delta_soc = self.cfg["ev_charge_soc_per_step"]
+            prev_soc = ev.soc
             ev.soc = min(target_soc, ev.soc + delta_soc)
+            charged_soc = max(0.0, ev.soc - prev_soc)
+            if charged_soc > 0:
+                charged_kwh = charged_soc * float(self.cfg["ev_battery_capacity_kwh"])
+                price_per_kwh = float(self.cfg.get("mcs_price_per_kwh", 1.6))
+                charged_revenue = charged_kwh * price_per_kwh
+                self.stats["mcs_total_energy_kwh"] += charged_kwh
+                self.stats["mcs_total_revenue"] += charged_revenue
+                mcs_id = ev.assigned_mcs_id
+                if mcs_id is not None:
+                    if mcs_id not in self.stats["mcs_revenue_by_mcs"]:
+                        self.stats["mcs_revenue_by_mcs"][mcs_id] = 0.0
+                    self.stats["mcs_revenue_by_mcs"][mcs_id] += charged_revenue
 
             if ev.soc >= target_soc:
                 ev.state = "DONE"
@@ -352,6 +364,8 @@ class ChargingEnv:
                 # Count dead/offline once, then remove from future transitions.
                 ev.state = "DONE"
 
+        mcs_num = max(1, int(self.cfg.get("mcs_num", len(self.mcs) if len(self.mcs) > 0 else 1)))
+        mcs_avg_revenue = float(self.stats["mcs_total_revenue"]) / float(mcs_num)
         info = {
             "served_total": self.stats["served_mcs"] + self.stats["served_fcs"],
             "success_rate": self._calculate_success_rate(),
@@ -360,7 +374,10 @@ class ChargingEnv:
             "waiting_count": self.stats["current_waiting"],
             "dead_count": self.stats["dead_evs"],
             "overdue_wait_steps": self.stats["overdue_wait_steps"],
-            "fcs_reassignments": self.stats["fcs_reassignments"]
+            "fcs_reassignments": self.stats["fcs_reassignments"],
+            "mcs_total_energy_kwh": float(self.stats["mcs_total_energy_kwh"]),
+            "mcs_total_revenue": float(self.stats["mcs_total_revenue"]),
+            "mcs_avg_revenue_per_vehicle": mcs_avg_revenue,
         }
 
         done = self.time_step >= self.cfg["max_steps"]

@@ -15,7 +15,7 @@ from config import *
 
 CONTEXT_LEN = 50
 BATCH_SIZE = 64
-EPOCHS = 150
+EPOCHS = 100
 MAX_LR = 2e-4  # peak learning rate
 WARMUP_STEPS = 300  # warmup steps
 WEIGHT_DECAY = 1e-4
@@ -47,6 +47,8 @@ TRAIN_LOG_COLUMNS = [
     "success_rate_std",
     "avg_wait_steps",
     "avg_wait_steps_std",
+    "mcs_avg_revenue_per_vehicle",
+    "mcs_avg_revenue_per_vehicle_std",
     "eval_num_seeds",
 ]
 
@@ -345,10 +347,17 @@ def evaluate_rollout_metrics(model, env, s_mean, s_std, a_mean, a_std, rtg_scale
             all_wait_durations.append(max(0, episode_end_step - start_step))
 
     avg_wait_steps_all = float(np.mean(all_wait_durations)) if all_wait_durations else 0.0
+    mcs_num = max(1, int(env.cfg.get("mcs_num", len(env.mcs) if len(env.mcs) > 0 else 1)))
+    mcs_total_revenue = float(final_info.get("mcs_total_revenue", env.stats.get("mcs_total_revenue", 0.0)))
+    mcs_avg_revenue_per_vehicle = float(
+        final_info.get("mcs_avg_revenue_per_vehicle", mcs_total_revenue / float(mcs_num))
+    )
     return {
         "success_rate": float(final_info.get("success_rate", env._calculate_success_rate())),
         # Full-wait metric: all WAITING episodes, ended by service/offline/rollout-end.
-        "avg_wait_steps": avg_wait_steps_all
+        "avg_wait_steps": avg_wait_steps_all,
+        "mcs_avg_revenue_per_vehicle": mcs_avg_revenue_per_vehicle,
+        "mcs_total_revenue": mcs_total_revenue,
     }
 
 
@@ -359,6 +368,7 @@ def evaluate_multi_seed_metrics(model, cfg, seed_list, s_mean, s_std, a_mean, a_
     """
     success_list = []
     wait_steps_list = []
+    mcs_avg_revenue_list = []
     eval_cfg = dict(cfg)
     eval_cfg["verbose_dataset_load"] = False
     for seed in seed_list:
@@ -378,12 +388,15 @@ def evaluate_multi_seed_metrics(model, cfg, seed_list, s_mean, s_std, a_mean, a_
         )
         success_list.append(m["success_rate"])
         wait_steps_list.append(m["avg_wait_steps"])
+        mcs_avg_revenue_list.append(m["mcs_avg_revenue_per_vehicle"])
 
     return {
         "success_rate": float(np.mean(success_list)),
         "success_rate_std": float(np.std(success_list)),
         "avg_wait_steps": float(np.mean(wait_steps_list)),
         "avg_wait_steps_std": float(np.std(wait_steps_list)),
+        "mcs_avg_revenue_per_vehicle": float(np.mean(mcs_avg_revenue_list)),
+        "mcs_avg_revenue_per_vehicle_std": float(np.std(mcs_avg_revenue_list)),
         "num_seeds": int(len(seed_list))
     }
 
@@ -484,6 +497,8 @@ def train(
         "success_rate_std": np.nan,
         "avg_wait_steps": np.nan,
         "avg_wait_steps_std": np.nan,
+        "mcs_avg_revenue_per_vehicle": np.nan,
+        "mcs_avg_revenue_per_vehicle_std": np.nan,
         "num_seeds": 0
     }
 
@@ -585,6 +600,8 @@ def train(
         history['success_rate_std'].append(last_eval_metrics['success_rate_std'])
         history['avg_wait_steps'].append(last_eval_metrics['avg_wait_steps'])
         history['avg_wait_steps_std'].append(last_eval_metrics['avg_wait_steps_std'])
+        history['mcs_avg_revenue_per_vehicle'].append(last_eval_metrics['mcs_avg_revenue_per_vehicle'])
+        history['mcs_avg_revenue_per_vehicle_std'].append(last_eval_metrics['mcs_avg_revenue_per_vehicle_std'])
         history['eval_num_seeds'].append(last_eval_metrics['num_seeds'])
 
         # Refresh CSV each epoch
@@ -597,6 +614,8 @@ def train(
             f"AuxR: {avg_train_aux_reward_loss:.4f}/{avg_val_aux_reward_loss:.4f} | "
             f"Success: {last_eval_metrics['success_rate']:.2f}\u00b1{last_eval_metrics['success_rate_std']:.2f}% | "
             f"AvgWait: {last_eval_metrics['avg_wait_steps']:.1f}\u00b1{last_eval_metrics['avg_wait_steps_std']:.1f} steps "
+            f"| MCSRev: {last_eval_metrics['mcs_avg_revenue_per_vehicle']:.1f}\u00b1"
+            f"{last_eval_metrics['mcs_avg_revenue_per_vehicle_std']:.1f} unit/MCS "
             f"(seeds={last_eval_metrics['num_seeds']})"
         )
 

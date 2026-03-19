@@ -144,8 +144,17 @@ def evaluate_and_benchmark():
     service_rate = (served_total / total_requests * 100.0) if total_requests > 0 else 100.0
     dead_rate = (dead_count / total_requests * 100.0) if total_requests > 0 else 0.0
     step_minutes = CONFIG.get("minutes_per_step", 24.0 * 60.0 / max(1, CONFIG["max_steps"]))
+    mcs_price_per_kwh = float(CONFIG.get("mcs_price_per_kwh", 1.6))
     avg_wait_all_steps = (
         float(np.mean(metrics["all_wait_durations"])) if metrics["all_wait_durations"] else 0.0
+    )
+    mcs_total_energy_kwh = float(final_info.get("mcs_total_energy_kwh", env.stats.get("mcs_total_energy_kwh", 0.0)))
+    mcs_total_revenue = float(final_info.get("mcs_total_revenue", env.stats.get("mcs_total_revenue", 0.0)))
+    mcs_avg_revenue = float(
+        final_info.get(
+            "mcs_avg_revenue_per_vehicle",
+            mcs_total_revenue / float(max(1, int(CONFIG.get("mcs_num", 1))))
+        )
     )
 
     print("\n" + "=" * 40)
@@ -163,6 +172,10 @@ def evaluate_and_benchmark():
     print(f"MCS Served: {env.stats.get('served_mcs', 0)}")
     print(f"FCS Served: {env.stats.get('served_fcs', 0)}")
     print(f"Average Wait (all waiting): {avg_wait_all_steps:.1f} steps ({avg_wait_all_steps * step_minutes:.1f} min)")
+    print(f"MCS Total Energy: {mcs_total_energy_kwh:.1f} kWh")
+    print(f"MCS Price: {mcs_price_per_kwh:.2f} unit/kWh")
+    print(f"MCS Total Revenue: {mcs_total_revenue:.1f} unit")
+    print(f"MCS Avg Revenue per Vehicle: {mcs_avg_revenue:.2f} unit/MCS")
     print(f"MCS Moving Steps: {metrics['mcs_moving_steps']}")
     print("=" * 40)
 

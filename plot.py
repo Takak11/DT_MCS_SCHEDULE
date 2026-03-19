@@ -260,3 +260,5 @@ def visualize_ev_demand(dataset_path="expert_dataset.pkl", episode_idx=0, mcs_nu
 
 if __name__ == "__main__":
     plot_training_and_service_metrics()
+    visualize_trajectory(episode_idx=100)
+    visualize_ev_demand(episode_idx=100)

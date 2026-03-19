@@ -10,6 +10,8 @@ import torch
 
 import train as train_module
 from config import CONFIG
+from env import ChargingEnv
+from generate_DT_dataset import assignment_memory, expert_get_action_with_commitment
 
 
 def _set_global_seed(seed):
@@ -66,7 +68,98 @@ def _run_single(label, use_car, dataset_path, log_dir, epochs, eval_seeds, seed)
     return log_path
 
 
-def _plot_compare(log_no_car, log_car, out_path):
+def _evaluate_expert_once(cfg, seed):
+    env_cfg = dict(cfg)
+    env_cfg["verbose_dataset_load"] = False
+    env = ChargingEnv(env_cfg)
+    env.seed(seed)
+    assignment_memory.clear()
+    env.reset()
+
+    wait_start_step = {}
+    all_wait_durations = []
+    final_info = {}
+    last_step = -1
+
+    for t in range(env_cfg["max_steps"]):
+        last_step = t
+        action = expert_get_action_with_commitment(env, epsilon=0.0)
+        prev_states = {ev.id: ev.state for ev in env.evs.values()}
+        _, _, done, info = env.step(action)
+        final_info = info
+
+        for ev in env.evs.values():
+            prev_state = prev_states.get(ev.id)
+            curr_state = ev.state
+            curr_source = ev.charging_source
+
+            if curr_state == "WAITING":
+                if prev_state != "WAITING":
+                    wait_start_step[ev.id] = t
+                continue
+
+            immediate_wait_then_service = (
+                prev_state == "MOVING" and
+                curr_state == "CHARGING" and
+                curr_source in {"MCS", "FCS"}
+            )
+            if immediate_wait_then_service:
+                all_wait_durations.append(0)
+                wait_start_step.pop(ev.id, None)
+                continue
+
+            if ev.id not in wait_start_step:
+                continue
+
+            start_step = wait_start_step[ev.id]
+            got_service_after_waiting = (
+                curr_state == "MOVING_TO_FCS" or
+                (curr_state == "CHARGING" and curr_source in {"MCS", "FCS"})
+            )
+            if got_service_after_waiting:
+                all_wait_durations.append(max(0, t - start_step))
+                wait_start_step.pop(ev.id, None)
+                continue
+
+            if prev_state == "WAITING":
+                all_wait_durations.append(max(0, t - start_step))
+                wait_start_step.pop(ev.id, None)
+
+        if done:
+            break
+
+    if wait_start_step and last_step >= 0:
+        episode_end_step = last_step + 1
+        for start_step in wait_start_step.values():
+            all_wait_durations.append(max(0, episode_end_step - start_step))
+
+    return {
+        "success_rate": float(final_info.get("success_rate", env._calculate_success_rate())),
+        "avg_wait_steps": float(np.mean(all_wait_durations)) if all_wait_durations else 0.0,
+    }
+
+
+def _evaluate_expert_multi_seed(cfg, seed_list):
+    if seed_list is None or len(seed_list) == 0:
+        seed_list = [42]
+
+    success = []
+    wait_steps = []
+    for seed in seed_list:
+        m = _evaluate_expert_once(cfg, seed)
+        success.append(m["success_rate"])
+        wait_steps.append(m["avg_wait_steps"])
+
+    return {
+        "success_rate": float(np.mean(success)),
+        "success_rate_std": float(np.std(success)),
+        "avg_wait_steps": float(np.mean(wait_steps)),
+        "avg_wait_steps_std": float(np.std(wait_steps)),
+        "num_seeds": int(len(seed_list)),
+    }
+
+
+def _plot_compare(log_no_car, log_car, out_path, expert_metrics=None):
     df0 = pd.read_csv(log_no_car).copy()
     df0["setting"] = "NO-CAR"
     df1 = pd.read_csv(log_car).copy()
@@ -80,6 +173,49 @@ def _plot_compare(log_no_car, log_car, out_path):
         axes[0].plot(g["epoch"], g["success_rate"], label=setting, color=colors[setting], lw=2)
         axes[1].plot(g["epoch"], g["avg_wait_steps"], label=setting, color=colors[setting], lw=2)
         axes[2].plot(g["epoch"], g["val_loss"], label=setting, color=colors[setting], lw=2)
+
+    if expert_metrics is not None and len(df) > 0:
+        x_min = float(df["epoch"].min())
+        x_max = float(df["epoch"].max())
+        ex_color = "#2ca02c"
+
+        ex_sr = float(expert_metrics["success_rate"])
+        ex_sr_std = float(expert_metrics["success_rate_std"])
+        axes[0].plot(
+            [x_min, x_max],
+            [ex_sr, ex_sr],
+            linestyle="--",
+            color=ex_color,
+            lw=2,
+            label=f"Expert ({ex_sr:.2f}±{ex_sr_std:.2f})",
+        )
+        if ex_sr_std > 0:
+            axes[0].fill_between(
+                [x_min, x_max],
+                [ex_sr - ex_sr_std, ex_sr - ex_sr_std],
+                [ex_sr + ex_sr_std, ex_sr + ex_sr_std],
+                color=ex_color,
+                alpha=0.12,
+            )
+
+        ex_w = float(expert_metrics["avg_wait_steps"])
+        ex_w_std = float(expert_metrics["avg_wait_steps_std"])
+        axes[1].plot(
+            [x_min, x_max],
+            [ex_w, ex_w],
+            linestyle="--",
+            color=ex_color,
+            lw=2,
+            label=f"Expert ({ex_w:.2f}±{ex_w_std:.2f})",
+        )
+        if ex_w_std > 0:
+            axes[1].fill_between(
+                [x_min, x_max],
+                [ex_w - ex_w_std, ex_w - ex_w_std],
+                [ex_w + ex_w_std, ex_w + ex_w_std],
+                color=ex_color,
+                alpha=0.12,
+            )
 
     axes[0].set_title("Success Rate")
     axes[0].set_xlabel("Epoch")
@@ -114,6 +250,7 @@ def main():
     parser.add_argument("--eval-seeds", type=str, default="42,43,44,45,46,47,48,49,50,51")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--skip-train", action="store_true")
+    parser.add_argument("--skip-expert", action="store_true")
     args = parser.parse_args()
 
     log_dir = Path(args.log_dir)
@@ -151,8 +288,19 @@ def main():
                 "skip-train enabled, but train_log_no_car.csv/train_log_car.csv not found in log-dir."
             )
 
+    expert_metrics = None
+    if not args.skip_expert:
+        expert_metrics = _evaluate_expert_multi_seed(CONFIG, eval_seeds)
+        print(
+            "\nExpert baseline | "
+            f"Success: {expert_metrics['success_rate']:.2f}±{expert_metrics['success_rate_std']:.2f}% | "
+            f"AvgWait: {expert_metrics['avg_wait_steps']:.2f}±{expert_metrics['avg_wait_steps_std']:.2f} "
+            f"(seeds={expert_metrics['num_seeds']})"
+        )
+        pd.DataFrame([expert_metrics]).to_csv(log_dir / "expert_baseline_metrics.csv", index=False)
+
     out_path = log_dir / "car_vs_no_car_training.png"
-    _plot_compare(log_no_car, log_car, out_path)
+    _plot_compare(log_no_car, log_car, out_path, expert_metrics=expert_metrics)
 
 
 if __name__ == "__main__":
