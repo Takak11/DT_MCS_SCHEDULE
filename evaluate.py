@@ -5,6 +5,7 @@ import pickle
 from env import ChargingEnv
 from config import CONFIG
 from DT import DecisionTransformer
+from car_module import apply_constraint_aware_reranking
 from generate_DT_dataset import get_state_vector, expert_get_action_with_commitment, assignment_memory
 
 CONTEXT_LEN = 50
@@ -31,9 +32,8 @@ def evaluate_and_benchmark():
     model.eval()
 
     metrics = {
-        "dead_evs": set(),
         "wait_start_step": {},
-        "served_wait_durations": [],
+        "all_wait_durations": [],
         "mcs_moving_steps": 0,
     }
 
@@ -45,7 +45,9 @@ def evaluate_and_benchmark():
 
     print("Start evaluation run...")
 
+    last_step = -1
     for t in range(CONFIG["max_steps"]):
+        last_step = t
         raw_state = get_state_vector(env)
         norm_state = (raw_state - s_mean) / s_std
 
@@ -81,6 +83,7 @@ def evaluate_and_benchmark():
         pred_action_norm = action_preds[0, -1].cpu().numpy()
         actions_hist[-1] = pred_action_norm
         real_action_matrix = (pred_action_norm * a_std + a_mean).reshape(CONFIG["mcs_num"], 2)
+        real_action_matrix = apply_constraint_aware_reranking(env, real_action_matrix)
 
         prev_states = {ev.id: ev.state for ev in env.evs.values()}
 
@@ -104,22 +107,20 @@ def evaluate_and_benchmark():
                     curr_source in {"MCS", "FCS"}
                 )
                 if immediate_wait_then_service:
-                    metrics["served_wait_durations"].append(0)
+                    metrics["all_wait_durations"].append(0)
                     metrics["wait_start_step"].pop(ev.id, None)
-                else:
+                elif ev.id in metrics["wait_start_step"]:
+                    start_step = metrics["wait_start_step"][ev.id]
                     got_service_after_waiting = (
-                        prev_state == "WAITING" and
-                        (
-                            curr_state == "MOVING_TO_FCS" or
-                            (curr_state == "CHARGING" and curr_source in {"MCS", "FCS"})
-                        )
+                        curr_state == "MOVING_TO_FCS" or
+                        (curr_state == "CHARGING" and curr_source in {"MCS", "FCS"})
                     )
                     if got_service_after_waiting:
-                        start_step = metrics["wait_start_step"].pop(ev.id, t)
-                        metrics["served_wait_durations"].append(max(0, t - start_step))
-
-            if curr_state == "DEAD":
-                metrics["dead_evs"].add(ev.id)
+                        metrics["all_wait_durations"].append(max(0, t - start_step))
+                        metrics["wait_start_step"].pop(ev.id, None)
+                    elif prev_state == "WAITING":
+                        metrics["all_wait_durations"].append(max(0, t - start_step))
+                        metrics["wait_start_step"].pop(ev.id, None)
 
         for mcs in env.mcs.values():
             if mcs.state == "MOVING":
@@ -128,18 +129,23 @@ def evaluate_and_benchmark():
         if done:
             break
 
+    if metrics["wait_start_step"] and last_step >= 0:
+        episode_end_step = last_step + 1
+        for start_step in metrics["wait_start_step"].values():
+            metrics["all_wait_durations"].append(max(0, episode_end_step - start_step))
+
     total_requests = env.stats.get("total_requests", 0)
     served_total = final_info.get(
         "served_total", env.stats.get("served_mcs", 0) + env.stats.get("served_fcs", 0)
     )
-    dead_count = len(metrics["dead_evs"])
+    dead_count = int(final_info.get("dead_count", env.stats.get("dead_evs", 0)))
     unresolved = max(0, total_requests - served_total - dead_count)
 
     service_rate = (served_total / total_requests * 100.0) if total_requests > 0 else 100.0
     dead_rate = (dead_count / total_requests * 100.0) if total_requests > 0 else 0.0
     step_minutes = CONFIG.get("minutes_per_step", 24.0 * 60.0 / max(1, CONFIG["max_steps"]))
-    avg_wait_served_steps = (
-        float(np.mean(metrics["served_wait_durations"])) if metrics["served_wait_durations"] else 0.0
+    avg_wait_all_steps = (
+        float(np.mean(metrics["all_wait_durations"])) if metrics["all_wait_durations"] else 0.0
     )
 
     print("\n" + "=" * 40)
@@ -156,7 +162,7 @@ def evaluate_and_benchmark():
     print(f"Dead Rate: {dead_rate:.2f}%")
     print(f"MCS Served: {env.stats.get('served_mcs', 0)}")
     print(f"FCS Served: {env.stats.get('served_fcs', 0)}")
-    print(f"Average Wait: {avg_wait_served_steps:.1f} steps ({avg_wait_served_steps * step_minutes:.1f} min)")
+    print(f"Average Wait (all waiting): {avg_wait_all_steps:.1f} steps ({avg_wait_all_steps * step_minutes:.1f} min)")
     print(f"MCS Moving Steps: {metrics['mcs_moving_steps']}")
     print("=" * 40)
 

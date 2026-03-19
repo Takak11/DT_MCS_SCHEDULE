@@ -186,6 +186,28 @@ class ChargingEnv:
             if ev_id not in waiting_ids:
                 del self.waiting_streak[ev_id]
 
+    def _enforce_wait_timeout(self):
+        """
+        Force offline when WAITING streak reaches configured timeout.
+        timeout <= 0 means disabled.
+        """
+        timeout_steps = int(self.cfg.get("wait_timeout_steps", 0))
+        if timeout_steps <= 0:
+            return
+
+        for ev in self.evs.values():
+            if ev.state != "WAITING":
+                continue
+            if self.waiting_streak.get(ev.id, 0) < timeout_steps:
+                continue
+
+            ev.state = "DEAD"
+            ev.charging_source = None
+            self._release_fcs_slot(ev)
+            self._release_mcs_service(ev)
+            if ev.id in self.waiting_streak:
+                del self.waiting_streak[ev.id]
+
     def _step_ev_to_fcs(self, ev):
         """Move EV toward assigned FCS with SOC consumption each step."""
         fcs = self.fcs.get(ev.target_fcs_id)
@@ -313,23 +335,22 @@ class ChargingEnv:
                 waiting_evs.remove(closest_ev)
 
         self._reassign_waiting_evs_to_fcs(waiting_evs)
-        self.stats["current_waiting"] = sum(1 for ev in self.evs.values() if ev.state == "WAITING")
         self._refresh_waiting_streak()
+        self._enforce_wait_timeout()
+        self.stats["current_waiting"] = sum(1 for ev in self.evs.values() if ev.state == "WAITING")
 
         for ev in self.evs.values():
             if ev.state == "WAITING":
                 reward += self.cfg["reward_wait_penalty"]
-                wait_target = int(self.cfg.get("wait_target_steps", 2))
-                wait_streak = self.waiting_streak.get(ev.id, 0)
-                if wait_streak > wait_target:
-                    reward += float(self.cfg.get("reward_wait_overdue_penalty", 0.0))
-                    self.stats["overdue_wait_steps"] += 1
+
             elif ev.state == "DEAD":
                 reward += self.cfg["reward_dead_penalty"]
                 self.stats["dead_evs"] += 1
                 self._release_fcs_slot(ev)
                 self._release_mcs_service(ev)
                 ev.charging_source = None
+                # Count dead/offline once, then remove from future transitions.
+                ev.state = "DONE"
 
         info = {
             "served_total": self.stats["served_mcs"] + self.stats["served_fcs"],

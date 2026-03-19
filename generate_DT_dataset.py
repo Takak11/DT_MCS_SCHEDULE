@@ -36,6 +36,7 @@ def get_state_vector(env, max_waiting_evs=50):
 
     return np.array(state_features, dtype=np.float32)
 
+
 def expert_get_action_with_commitment(env, epsilon=0.0):
     global assignment_memory
 

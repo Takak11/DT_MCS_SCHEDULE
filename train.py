@@ -10,18 +10,19 @@ import pandas as pd
 from DT import DecisionTransformer
 from env import ChargingEnv
 from generate_DT_dataset import get_state_vector
+from car_module import apply_constraint_aware_reranking
 from config import *
 
 CONTEXT_LEN = 50
 BATCH_SIZE = 64
-EPOCHS = 50
+EPOCHS = 150
 MAX_LR = 2e-4  # peak learning rate
 WARMUP_STEPS = 300  # warmup steps
 WEIGHT_DECAY = 1e-4
 ACTIVE_LOSS_WEIGHT = 2.0
 ACTIVE_MOVE_THRESH_DEG = 1e-6
 AUX_REWARD_LOSS_WEIGHT = 0.05
-EVAL_TARGET_RETURN = 150000.0
+EVAL_TARGET_RETURN = 200300.0
 EVAL_SEEDS = [42, 43, 44, 45, 46, 47, 48, 49, 50, 51]
 EVAL_EVERY_EPOCHS = 1
 EARLY_STOP_PATIENCE = 15
@@ -35,9 +36,6 @@ BUSINESS_MIN_SUCCESS_RATE = float(CONFIG.get("business_min_success_rate", 93.0))
 
 TRAIN_LOG_COLUMNS = [
     "epoch",
-    "phase",
-    "phase_id",
-    "phase_epoch",
     "train_loss",
     "val_loss",
     "train_aux_reward_loss",
@@ -248,11 +246,13 @@ def evaluate_rollout_metrics(model, env, s_mean, s_std, a_mean, a_std, rtg_scale
     final_info = {}
 
     wait_start_step = {}
-    served_wait_durations = []
+    all_wait_durations = []
+    last_step = -1
 
     model.eval()
     with torch.no_grad():
         for t in range(env.cfg["max_steps"]):
+            last_step = t
             raw_state = get_state_vector(env)
             norm_state = (raw_state - s_mean) / s_std
 
@@ -286,6 +286,7 @@ def evaluate_rollout_metrics(model, env, s_mean, s_std, a_mean, a_std, rtg_scale
             pred_action_norm = action_preds[0, -1].cpu().numpy()
             actions_hist[-1] = pred_action_norm
             real_action_matrix = (pred_action_norm * a_std + a_mean).reshape(env.cfg["mcs_num"], 2)
+            real_action_matrix = apply_constraint_aware_reranking(env, real_action_matrix)
 
             prev_states = {ev.id: ev.state for ev in env.evs.values()}
 
@@ -304,36 +305,50 @@ def evaluate_rollout_metrics(model, env, s_mean, s_std, a_mean, a_std, rtg_scale
                     continue
 
                 # MOVING -> WAITING -> CHARGING can occur within one env step.
-                # This means "wait started then got served immediately", so wait = 0 step.
+                # Count this as one full waiting episode with 0-step delay.
                 immediate_wait_then_service = (
                     prev_state == "MOVING" and
                     curr_state == "CHARGING" and
                     curr_source in {"MCS", "FCS"}
                 )
                 if immediate_wait_then_service:
-                    served_wait_durations.append(0)
+                    all_wait_durations.append(0)
                     wait_start_step.pop(ev.id, None)
                     continue
 
+                if ev.id not in wait_start_step:
+                    continue
+
+                start_step = wait_start_step[ev.id]
                 got_service_after_waiting = (
-                    prev_state == "WAITING" and
-                    (
-                        curr_state == "MOVING_TO_FCS" or
-                        (curr_state == "CHARGING" and curr_source in {"MCS", "FCS"})
-                    )
+                    curr_state == "MOVING_TO_FCS" or
+                    (curr_state == "CHARGING" and curr_source in {"MCS", "FCS"})
                 )
                 if got_service_after_waiting:
-                    start_step = wait_start_step.pop(ev.id, t)
-                    served_wait_durations.append(max(0, t - start_step))
+                    all_wait_durations.append(max(0, t - start_step))
+                    wait_start_step.pop(ev.id, None)
+                    continue
+
+                # Full-wait metric: when a waiting EV exits WAITING without service
+                # (timeout/offline/episode dynamics), still close this waiting episode.
+                if prev_state == "WAITING":
+                    all_wait_durations.append(max(0, t - start_step))
+                    wait_start_step.pop(ev.id, None)
 
             if done:
                 break
 
-    avg_wait_steps_served = float(np.mean(served_wait_durations)) if served_wait_durations else 0.0
+    # Include unfinished waiting episodes at rollout end in full-wait metric.
+    if wait_start_step and last_step >= 0:
+        episode_end_step = last_step + 1
+        for start_step in wait_start_step.values():
+            all_wait_durations.append(max(0, episode_end_step - start_step))
+
+    avg_wait_steps_all = float(np.mean(all_wait_durations)) if all_wait_durations else 0.0
     return {
         "success_rate": float(final_info.get("success_rate", env._calculate_success_rate())),
-        # Canonical wait metric: WAITING start -> first service handling step.
-        "avg_wait_steps": avg_wait_steps_served
+        # Full-wait metric: all WAITING episodes, ended by service/offline/rollout-end.
+        "avg_wait_steps": avg_wait_steps_all
     }
 
 
@@ -373,7 +388,7 @@ def evaluate_multi_seed_metrics(model, cfg, seed_list, s_mean, s_std, a_mean, a_
     }
 
 
-def _init_history(log_path, append_log, default_phase="DT", default_phase_id=0):
+def _init_history(log_path, append_log):
     history = {k: [] for k in TRAIN_LOG_COLUMNS}
     epoch_offset = 0
 
@@ -398,12 +413,6 @@ def _init_history(log_path, append_log, default_phase="DT", default_phase_id=0):
     for col in TRAIN_LOG_COLUMNS:
         if col in old_df.columns:
             history[col] = old_df[col].tolist()
-        elif col == "phase":
-            history[col] = [default_phase] * row_num
-        elif col == "phase_id":
-            history[col] = [default_phase_id] * row_num
-        elif col == "phase_epoch":
-            history[col] = list(range(1, row_num + 1))
         else:
             history[col] = [np.nan] * row_num
 
@@ -415,12 +424,10 @@ def train(
     init_ckpt=None,
     log_path="train_log_v2.csv",
     append_log=False,
-    phase="DT",
-    phase_id=0,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    history, epoch_offset = _init_history(log_path, append_log, default_phase="DT", default_phase_id=0)
+    history, epoch_offset = _init_history(log_path, append_log)
 
 
     full_dataset = ExpertDataset(dataset_path, CONTEXT_LEN)
@@ -549,9 +556,6 @@ def train(
         avg_dist_m = np.mean(val_dist_errors)
         global_epoch = epoch_offset + epoch + 1
         history['epoch'].append(global_epoch)
-        history['phase'].append(str(phase))
-        history['phase_id'].append(int(phase_id))
-        history['phase_epoch'].append(epoch + 1)
         history['train_loss'].append(avg_train_loss)
         history['val_loss'].append(avg_val_loss)
         history['train_aux_reward_loss'].append(avg_train_aux_reward_loss)
@@ -705,7 +709,7 @@ def train(
         f"Best window({EARLY_STOP_WINDOW}) val-loss mean: "
         f"{(best_window_val_loss if best_window_val_loss < float('inf') else float('nan')):.4f} | "
         f"ES min epochs: {effective_early_stop_min_epochs} | "
-        f"Best avg wait(served): {best_avg_wait_steps:.2f} steps "
+        f"Best avg wait(all waiting): {best_avg_wait_steps:.2f} steps "
         f"({best_avg_wait_steps * CONFIG.get('minutes_per_step', 24.0 * 60.0 / max(1, CONFIG.get('max_steps', 200))):.2f} min)"
     )
 
